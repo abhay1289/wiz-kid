@@ -130,6 +130,18 @@ p, li { text-wrap: pretty; }
   3% { transform: skewX(0deg) scale(1); filter: hue-rotate(180deg); }
   100% { transform: skewX(0deg) scale(1); filter: hue-rotate(0deg); }
 }
+/* Disable ALL expensive CSS animations on mobile to free GPU for video scroll-scrub */
+@media (max-width: 1024px) {
+  .hero-title, .section-title, .split-title { animation: none !important; }
+  .display-1 em, .display-2 em, .display-3 em { animation: none !important; }
+  .particles, .particle { display: none !important; }
+  .about { animation: none !important; }
+  .about__media img, .stack-card img { will-change: auto !important; }
+  .parallax-wrap img { will-change: auto !important; transition: none !important; }
+  .text-parallax { will-change: auto !important; transition: none !important; }
+  .glow-blob { display: none !important; }
+  .hairline-grid { display: none !important; }
+}
 
 /* Wormhole Hero */
 .hero-sticky { overflow: hidden; background: #130E1C !important; }
@@ -143,6 +155,10 @@ p, li { text-wrap: pretty; }
   0% { transform: rotate(0deg) scale(1); }
   50% { transform: rotate(180deg) scale(1.2); }
   100% { transform: rotate(360deg) scale(1); }
+}
+/* Kill the expensive wormhole on mobile/tablet to free GPU for video scrub */
+@media (max-width: 1024px) {
+  .hero-sticky::before { display: none !important; }
 }
 .hero-sticky .wrap, .hero-sticky video { position: relative; z-index: 2; }
 /* ---------------------------------- */
@@ -364,7 +380,11 @@ p, li { text-wrap: pretty; }
 .hero{position:relative;height:500vh;}
 .hero-sticky{position:sticky;top:0;height:100vh;overflow:hidden;background:linear-gradient(160deg,var(--dusk),var(--ink));}
 .hero-video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;filter:brightness(1.04) contrast(1.05) saturate(1.08);z-index:0;
-  transform-origin:center center;will-change:transform,filter,opacity;transition:filter .6s ease-out;}
+  transform-origin:center center;will-change:transform;transition:filter .6s ease-out;}
+/* On mobile, strip heavy filters to let the GPU focus on transform+seek */
+@media (max-width: 1024px) {
+  .hero-video { filter: none; transition: none; }
+}
 .hero-overlay{position:absolute;inset:0;pointer-events:none;z-index:1;
   background:
     linear-gradient(180deg, rgba(0,0,0,0.32) 0%, rgba(0,0,0,0.18) 50%, rgba(0,0,0,0.52) 100%),
@@ -1498,9 +1518,30 @@ section[id]{scroll-margin-top:88px;}
 <section class="hero" id="hero">
   <div class="editorial-vertical" style="color: rgba(255,255,255,0.25);">EST. 2024 &nbsp; | &nbsp; WIZ KIDZ CHEESESTEAKS</div>
   <div class="hero-sticky">
-    <video class="hero-video" id="heroVideo" autoplay loop muted playsinline webkit-playsinline preload="auto" poster="images/real/food_1.jpg">
-      <source src="cheesesteak-scrub.mp4" type="video/mp4">
+    <!-- NOTE: autoplay & loop intentionally REMOVED — the scroll-scrub JS controls playback via
+         video.currentTime. Having autoplay+loop causes the decoder to fight our seek commands
+         on iOS, which is the #1 cause of mobile jank.
+         
+         ENCODING TIP: For the smoothest mobile scrub, re-encode with ALL keyframes:
+         ffmpeg -i cheesesteak-scrub.mp4 -vf scale=1280:720 -c:v libx264 -preset slow
+                -crf 23 -g 1 -keyint_min 1 -an -movflags +faststart cheesesteak-scrub-mobile.mp4
+         Then serve the smaller file to mobile via <source media="(max-width:1024px)"> -->
+    <video class="hero-video" id="heroVideo" muted playsinline webkit-playsinline preload="auto" poster="images/real/food_1.jpg">
+      <!-- Source set dynamically below — mobile gets the 720p all-keyframe build -->
     </video>
+    <script>
+      // Pick the right video source BEFORE the browser starts buffering.
+      // Safari ignores the `media` attr on <source> so we do it in JS.
+      (function(){
+        var v = document.getElementById('heroVideo');
+        var isMob = window.innerWidth <= 1024 || ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+        var src = document.createElement('source');
+        src.type = 'video/mp4';
+        src.src = isMob ? 'cheesesteak-scrub-mobile.mp4' : 'cheesesteak-scrub.mp4';
+        v.appendChild(src);
+        v.load(); // trigger buffering of the chosen source
+      })();
+    </script>
     <div class="hero-overlay"></div>
     <div class="hero-content">
 
@@ -1975,12 +2016,17 @@ section[id]{scroll-margin-top:88px;}
   });
 
   // ===== Smooth Scrolling (Lenis) =====
+  // On mobile/touch devices, disable Lenis smooth scroll entirely.
+  // Lenis intercepts native touch scrolling and re-dispatches it with easing,
+  // adding an extra frame of latency that makes video scrub feel laggy.
+  const isTouchDevice = ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
   const lenis = new Lenis({
     duration: 1.6,
     easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t)),
-    smoothWheel: true,
+    smoothWheel: !isTouchDevice,
+    smoothTouch: false,           // never hijack touch scroll
     wheelMultiplier: 1.0,
-    touchMultiplier: 1.5
+    touchMultiplier: 1.0
   });
 
   const grain = document.querySelector('.grain');
@@ -2022,10 +2068,22 @@ section[id]{scroll-margin-top:88px;}
     
     video.muted = true;
     video.playsInline = true;
+    // Ensure the video is paused so the autoplay decoder doesn't fight our seeks
+    video.pause();
+    // Remove loop attr to prevent jump-back at end of scrub range
+    video.removeAttribute('loop');
     
-    // Unlock WebKit media decoder for iOS Safari seeking
+    // Unlock WebKit media decoder for iOS Safari seeking.
+    // On iOS the very first seek will stall unless the media engine has been "warmed up"
+    // with a brief play()+pause(). We do this once, and also once on first touch/scroll.
+    let webkitUnlocked = false;
     const unlockWebkit = () => {
-      video.play().then(() => video.pause()).catch(() => {});
+      if (webkitUnlocked) return;
+      webkitUnlocked = true;
+      video.play().then(() => {
+        video.pause();
+        video.currentTime = 0;
+      }).catch(() => {});
     };
     unlockWebkit();
     window.addEventListener('touchstart', unlockWebkit, { once: true });
@@ -2037,14 +2095,30 @@ section[id]{scroll-margin-top:88px;}
     let currentProgress = 0;
     let rafRunning = false;
     let lastSetTime = 0;
+    let pendingSeekTime = -1;
 
-    const LERP = isMobile ? 0.22 : 0.15;
-    const EPSILON = 0.0001;
+    // On mobile, use a faster LERP so the video catches up quickly
+    // instead of trailing behind the finger
+    const LERP = isMobile ? 0.35 : 0.15;
+    const EPSILON = 0.0005;
+    // Mobile seek throttle: ~16fps (60ms) is the sweet spot for iOS WebKit
+    // to avoid queuing multiple seeks that cause jank
+    const SEEK_THROTTLE_MS = isMobile ? 60 : 0;
+
+    // Use requestVideoFrameCallback where available for jank-free seeking
+    const hasRVFC = typeof video.requestVideoFrameCallback === 'function';
 
     function updateScroll(){
+      const rect = hero.getBoundingClientRect();
       const scrollable = hero.offsetHeight - innerHeight;
-      targetProgress = Math.min(1, Math.max(0, -hero.getBoundingClientRect().top / scrollable));
+      if (scrollable <= 0) return;
+      targetProgress = Math.min(1, Math.max(0, -rect.top / scrollable));
       if (!rafRunning) { rafRunning = true; requestAnimationFrame(tick); }
+    }
+
+    function applyVideoTime(t) {
+      if (isNaN(t) || t === video.currentTime) return;
+      video.currentTime = t;
     }
 
     function tick(){
@@ -2056,22 +2130,31 @@ section[id]{scroll-margin-top:88px;}
 
       if (!isNaN(video.duration) && video.duration > 0) {
         const t = Math.min(currentProgress * video.duration, video.duration - 0.05);
-        if (isMobile) {
-          // Throttle video.currentTime updates on mobile to ~25fps to eliminate iOS WebKit seek lag
+
+        if (SEEK_THROTTLE_MS > 0) {
+          // On mobile, throttle seeks to avoid overwhelming the WebKit decoder
           const now = performance.now();
-          if (now - lastSetTime > 38 || Math.abs(t - video.currentTime) > 0.06) {
-            video.currentTime = t;
+          if (now - lastSetTime > SEEK_THROTTLE_MS || Math.abs(t - video.currentTime) > 0.15) {
+            applyVideoTime(t);
             lastSetTime = now;
           }
+        } else if (hasRVFC && !isMobile) {
+          // On desktop with RVFC, schedule the seek for the next decoded frame
+          pendingSeekTime = t;
         } else {
-          video.currentTime = t;
+          applyVideoTime(t);
         }
       }
 
-      // Keep background video bright and visible throughout scroll
-      const scale = 1 + currentProgress * 0.12;
-      video.style.transform = 'scale(' + scale + ')';
-      video.style.opacity = 1 - (currentProgress * 0.1);
+      // Only apply scale transform on mobile (skip opacity for GPU savings)
+      if (isMobile) {
+        const scale = 1 + currentProgress * 0.12;
+        video.style.transform = 'scale(' + scale + ')';
+      } else {
+        const scale = 1 + currentProgress * 0.12;
+        video.style.transform = 'scale(' + scale + ')';
+        video.style.opacity = 1 - (currentProgress * 0.1);
+      }
 
       // Heading index
       const idx = Math.min(heads.length - 1, Math.floor(currentProgress * heads.length));
@@ -2089,6 +2172,18 @@ section[id]{scroll-margin-top:88px;}
       }
     }
 
+    // RVFC loop: applies pending seek at the optimal video decode moment
+    if (hasRVFC && !isMobile) {
+      function onVideoFrame() {
+        if (pendingSeekTime >= 0) {
+          applyVideoTime(pendingSeekTime);
+          pendingSeekTime = -1;
+        }
+        video.requestVideoFrameCallback(onVideoFrame);
+      }
+      video.requestVideoFrameCallback(onVideoFrame);
+    }
+
     addEventListener('scroll', updateScroll, {passive:true});
     updateScroll();
   }
@@ -2096,13 +2191,19 @@ section[id]{scroll-margin-top:88px;}
   // ===== Nav background on scroll =====
   const nav = document.getElementById('nav');
   const lightSections = document.querySelectorAll('.about, .stats, .experiences, .testi');
+  let navRafQueued = false;
   function navState(){
+    navRafQueued = false;
     nav.classList.toggle('nav--scrolled', window.scrollY > 40);
+    // Skip the expensive getBoundingClientRect loop while hero is in viewport
+    // (user can't see light sections yet, so the class toggle is pointless)
+    const heroBottom = document.getElementById('hero')?.getBoundingClientRect().bottom ?? 0;
+    if (heroBottom > 0) { nav.classList.remove('nav--on-light'); return; }
     const probe = 34; let onLight = false;
     lightSections.forEach(s => { const r = s.getBoundingClientRect(); if (r.top <= probe && r.bottom >= probe) onLight = true; });
     nav.classList.toggle('nav--on-light', onLight);
   }
-  addEventListener('scroll', () => requestAnimationFrame(navState), {passive:true});
+  addEventListener('scroll', () => { if (!navRafQueued) { navRafQueued = true; requestAnimationFrame(navState); } }, {passive:true});
   navState();
 
   // ===== Fullscreen menu toggle =====
@@ -2172,7 +2273,13 @@ section[id]{scroll-margin-top:88px;}
   // ===== Stacked-card scale as the next card slides over =====
   const stackCards = [...document.querySelectorAll('.stack-card')];
   stackCards.forEach(c => { c.style.transition = 'filter .25s ease'; });
+  let stackRafQueued = false;
   function stackFx(){
+    stackRafQueued = false;
+    // Skip entirely while hero is in viewport — the cards aren't visible
+    // and this prevents layout thrashing from getBoundingClientRect during scrub
+    const heroBottom = document.getElementById('hero')?.getBoundingClientRect().bottom ?? 0;
+    if (heroBottom > 0) return;
     const stick = innerHeight * 0.14;
     stackCards.forEach((card, i) => {
       const next = stackCards[i+1]; if (!next) return;
@@ -2182,7 +2289,7 @@ section[id]{scroll-margin-top:88px;}
       card.style.filter = `brightness(${1 - t*0.28})`;
     });
   }
-  addEventListener('scroll', () => requestAnimationFrame(stackFx), {passive:true});
+  addEventListener('scroll', () => { if (!stackRafQueued) { stackRafQueued = true; requestAnimationFrame(stackFx); } }, {passive:true});
   stackFx();
 
   // ===== Gallery lightbox — click any frame to enlarge =====
@@ -2354,41 +2461,30 @@ section[id]{scroll-margin-top:88px;}
     
     testiCards.forEach(c => observer.observe(c));
   }
-  // ===== Playful Cheese Drip Cursor =====
-  const createCheeseDrip = (x, y) => {
-    const drip = document.createElement('div');
-    const size = Math.random() * 15 + 5;
-    drip.style.position = 'fixed';
-    drip.style.left = `${x}px`;
-    drip.style.top = `${y}px`;
-    drip.style.width = `${size}px`;
-    drip.style.height = `${size}px`;
-    drip.style.background = Math.random() > 0.5 ? 'var(--gold)' : 'var(--gold-deep)';
-    drip.style.borderRadius = '50%';
-    drip.style.pointerEvents = 'none';
-    drip.style.zIndex = '9999';
-    drip.style.transition = 'all 1s cubic-bezier(0.3, 1, 0.3, 1)';
-    drip.style.opacity = '0.8';
-    drip.style.transform = `translate(-50%, -50%) scale(1)`;
-    document.body.appendChild(drip);
+  // ===== Playful Cheese Drip Cursor (desktop only) =====
+  // Disabled on touch devices — DOM element spam tanks scroll perf
+  if (!isTouchDevice) {
+    const createCheeseDrip = (x, y) => {
+      const drip = document.createElement('div');
+      const size = Math.random() * 15 + 5;
+      drip.style.cssText = `position:fixed;left:${x}px;top:${y}px;width:${size}px;height:${size}px;background:${Math.random() > 0.5 ? 'var(--gold)' : 'var(--gold-deep)'};border-radius:50%;pointer-events:none;z-index:9999;transition:all 1s cubic-bezier(0.3,1,0.3,1);opacity:0.8;transform:translate(-50%,-50%) scale(1)`;
+      document.body.appendChild(drip);
+      setTimeout(() => {
+        drip.style.transform = `translate(-50%, ${Math.random() * 80 + 40}px) scale(0)`;
+        drip.style.opacity = '0';
+      }, 10);
+      setTimeout(() => { drip.remove(); }, 1000);
+    };
 
-    // Fall and fade
-    setTimeout(() => {
-      drip.style.transform = `translate(-50%, ${Math.random() * 80 + 40}px) scale(0)`;
-      drip.style.opacity = '0';
-    }, 10);
-
-    setTimeout(() => { drip.remove(); }, 1000);
-  };
-
-  let lastDripTime = 0;
-  window.addEventListener('mousemove', (e) => {
-    const now = Date.now();
-    if (now - lastDripTime > 40) { // throttle spawn rate
-      createCheeseDrip(e.clientX, e.clientY);
-      lastDripTime = now;
-    }
-  });
+    let lastDripTime = 0;
+    window.addEventListener('mousemove', (e) => {
+      const now = Date.now();
+      if (now - lastDripTime > 40) {
+        createCheeseDrip(e.clientX, e.clientY);
+        lastDripTime = now;
+      }
+    });
+  }
 
 
 
